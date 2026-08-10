@@ -77,6 +77,7 @@ def get_overlay_config_path() -> Path:
 
 # --- Timeouts ---
 
+START_SAFETY_TIMEOUT = 7.0  # seconds
 STOP_SAFETY_TIMEOUT = 1.0  # seconds
 DEBOUNCE_INTERVAL = 0.3  # seconds
 PASTE_DELAY = 0.05  # seconds between copy and paste simulation

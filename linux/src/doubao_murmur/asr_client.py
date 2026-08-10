@@ -45,6 +45,9 @@ class ASRClient:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._task: asyncio.Task | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._stop_requested = threading.Event()
 
         # Callbacks (called from asyncio thread - must use GLib.idle_add for GTK)
         self.on_open = None  # () -> None
@@ -59,16 +62,38 @@ class ASRClient:
 
     def connect(self, params: ASRParams) -> None:
         """Start WebSocket connection on a background asyncio loop."""
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run_loop, args=(params,), daemon=True
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("ASR connection is already running")
+            self._stop_requested.clear()
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._run_loop, args=(params,), daemon=True
+            )
+            self._thread.start()
 
     def _run_loop(self, params: ASRParams) -> None:
         """Run asyncio event loop in background thread."""
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._connect_and_listen(params))
+        loop = self._loop
+        if loop is None:
+            return
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(self._connect_and_listen(params))
+        with self._lifecycle_lock:
+            self._task = task
+            if self._stop_requested.is_set():
+                task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+            loop.close()
+            with self._lifecycle_lock:
+                if self._task is task:
+                    self._task = None
 
     async def _connect_and_listen(self, params: ASRParams) -> None:
         """Build URL, connect, receive messages."""
@@ -129,6 +154,9 @@ class ASRClient:
                 self._connected = False
                 if self.on_error:
                     self.on_error(e)
+        finally:
+            self._connected = False
+            self._ws = None
 
     def _build_url(self, params: ASRParams) -> str:
         """Construct the full WSS URL with query parameters."""
@@ -160,13 +188,17 @@ class ASRClient:
     def disconnect(self) -> None:
         """Close the WebSocket."""
         self._connected = False
+        self._stop_requested.set()
         with self._lock:
             self._pending_audio.clear()
-        if self._ws and self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._ws.close(1000, "1000-"), self._loop
-            )
-        self._ws = None
+        with self._lifecycle_lock:
+            loop = self._loop
+            task = self._task
+            if task is not None and not task.done():
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(task.cancel)
+                else:
+                    task.cancel()
         logger.info("Disconnected")
 
     def _flush_audio_buffer(self) -> None:
