@@ -20,7 +20,6 @@ from doubao_murmur.asr_client import ASRClient
 from doubao_murmur.audio_capture import AudioCapture
 from doubao_murmur.config import (
     AUTH_EXPIRY_DELAY,
-    FINAL_RESULT_QUIET_PERIOD,
     START_SAFETY_TIMEOUT,
     STOP_SAFETY_TIMEOUT,
 )
@@ -58,8 +57,6 @@ class TranscriptionManager:
         self._active_generation: int | None = None
         self.start_timer_id: int | None = None
         self.safety_timer_id: int | None = None
-        # Pending completion, rescheduled on each late result so only the last wins.
-        self.quiet_timer_id: int | None = None
 
         # Callbacks set by app.py
         self.on_auth_expired = None  # () -> None
@@ -169,7 +166,6 @@ class TranscriptionManager:
         self._cancel_start_timer()
         self._set_state(RecordingState.STOPPING)
         self.audio_capture.stop()
-        # Flushes trailing silence so the server finalises the last word.
         self.asr_client.finish_sending()
         self.awaiting_final_result = True
 
@@ -180,43 +176,13 @@ class TranscriptionManager:
             self._active_generation,
         )
 
-    def _schedule_final_completion(self, generation: int) -> None:
-        """Wait for the result stream to go quiet before accepting the transcript.
-
-        The server streams corrections right up to the end: after the audio stops
-        it replays the pending partial results first, and only then sends the one
-        carrying the final word. Completing on the first result to arrive after
-        stopping truncates the tail -- the "last two characters are missing"
-        symptom -- so each late result pushes the deadline back instead.
-        """
-        if not self._is_active_generation(generation):
-            return
-        self._cancel_quiet_timer()
-        self.quiet_timer_id = GLib.timeout_add(
-            int(FINAL_RESULT_QUIET_PERIOD * 1000),
-            self._on_stream_quiet,
-            generation,
-        )
-
-    def _on_stream_quiet(self, generation: int) -> bool:
-        if not self._is_active_generation(generation):
-            return GLib.SOURCE_REMOVE
-        self.quiet_timer_id = None
+    def _safety_timeout(self, generation: int | None) -> bool:
         if (
-            self.awaiting_final_result
+            generation == self._active_generation
             and self.app_state.recording_state == RecordingState.STOPPING
         ):
-            logger.info("Result stream quiet, completing")
-            self.awaiting_final_result = False
-            self._complete_transcription()
-        return GLib.SOURCE_REMOVE
-
-    def _safety_timeout(self, generation: int | None) -> bool:
-        if generation != self._active_generation:
-            return GLib.SOURCE_REMOVE
-        self.safety_timer_id = None
-        if self.app_state.recording_state == RecordingState.STOPPING:
             logger.info("Safety timeout, completing with current text")
+            self.safety_timer_id = None
             self.awaiting_final_result = False
             self._complete_transcription()
         return GLib.SOURCE_REMOVE
@@ -247,11 +213,6 @@ class TranscriptionManager:
             GLib.source_remove(self.safety_timer_id)
             self.safety_timer_id = None
 
-    def _cancel_quiet_timer(self) -> None:
-        if self.quiet_timer_id is not None:
-            GLib.source_remove(self.quiet_timer_id)
-            self.quiet_timer_id = None
-
     def _is_active_generation(self, generation: int) -> bool:
         return generation == self._active_generation
 
@@ -275,7 +236,8 @@ class TranscriptionManager:
         if self.app_state.recording_state == RecordingState.STARTING:
             self._set_state(RecordingState.RECORDING)
         if self.awaiting_final_result:
-            self._schedule_final_completion(generation)
+            self.awaiting_final_result = False
+            self._complete_transcription()
         return GLib.SOURCE_REMOVE
 
     def _on_asr_finish(self, generation: int) -> bool:
@@ -321,14 +283,6 @@ class TranscriptionManager:
 
     # --- Completion & Reset ---
 
-    def _cancel_stop_timers(self) -> None:
-        """Drop any pending stop-phase timers so they cannot fire after reset."""
-        for attr in ("quiet_timer_id", "safety_timer_id"):
-            timer_id = getattr(self, attr)
-            if timer_id is not None:
-                GLib.source_remove(timer_id)
-                setattr(self, attr, None)
-
     def _complete_transcription(self) -> None:
         text = self.app_state.transcription_text.strip()
         logger.info("Completing transcription: '%s'", text[:50])
@@ -340,8 +294,8 @@ class TranscriptionManager:
         if generation is not None and generation != self._active_generation:
             return GLib.SOURCE_REMOVE
         self._cancel_start_timer()
+        self._cancel_safety_timer()
         self.awaiting_final_result = False
-        self._cancel_stop_timers()
         self.audio_capture.stop()
         self.asr_client.disconnect()
         self._set_state(RecordingState.IDLE)
