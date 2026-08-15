@@ -166,6 +166,7 @@ class TranscriptionManager:
 
     def _stop_recording(self) -> None:
         logger.info("Stopping recording...")
+        was_starting = self.app_state.recording_state == RecordingState.STARTING
         self._cancel_start_timer()
         self._set_state(RecordingState.STOPPING)
         self.audio_capture.stop()
@@ -173,11 +174,20 @@ class TranscriptionManager:
         self.asr_client.finish_sending()
         self.awaiting_final_result = True
 
-        # Safety timeout
-        self.safety_timer_id = GLib.timeout_add(
-            int(STOP_SAFETY_TIMEOUT * 1000),
-            self._safety_timeout,
+        # A stop pressed during a slow handshake must leave enough time for the
+        # queued speech to connect and flush. Once the socket opens, _on_asr_open
+        # replaces this with the normal short final-result deadline.
+        self._arm_safety_timeout(
+            START_SAFETY_TIMEOUT if was_starting else STOP_SAFETY_TIMEOUT,
             self._active_generation,
+        )
+
+    def _arm_safety_timeout(
+        self, timeout: float, generation: int | None
+    ) -> None:
+        self._cancel_safety_timer()
+        self.safety_timer_id = GLib.timeout_add(
+            int(timeout * 1000), self._safety_timeout, generation
         )
 
     def _schedule_final_completion(self, generation: int) -> None:
@@ -263,6 +273,13 @@ class TranscriptionManager:
         self._cancel_start_timer()
         if self.app_state.recording_state == RecordingState.STARTING:
             self._set_state(RecordingState.RECORDING)
+        elif (
+            self.app_state.recording_state == RecordingState.STOPPING
+            and self.awaiting_final_result
+        ):
+            self._arm_safety_timeout(
+                STOP_SAFETY_TIMEOUT, generation
+            )
         return GLib.SOURCE_REMOVE
 
     def _on_asr_result(self, generation: int, text: str) -> bool:

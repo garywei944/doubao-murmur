@@ -214,6 +214,67 @@ class TestDependencyHandling:
 
 
 class TestConnectionLifecycle:
+    def test_finish_before_connect_preserves_audio_and_queues_silence(
+        self, monkeypatch
+    ):
+        sent = []
+
+        class FakeWebSocket:
+            async def send(self, data):
+                sent.append(data)
+
+        class FakeLoop:
+            @staticmethod
+            def is_running():
+                return True
+
+        def run_now(coro, loop):
+            asyncio.run(coro)
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_now)
+        client = ASRClient()
+        speech = b"captured-before-websocket-opened"
+        client.send_audio(speech)
+
+        client.finish_sending(trailing_silence_ms=200)
+
+        assert client._pending_audio == [speech, bytes(3200), bytes(3200)]
+
+        client._ws = FakeWebSocket()
+        client._loop = FakeLoop()  # type: ignore[assignment]
+        client._connected = True
+        client._flush_audio_buffer()
+
+        assert sent == [speech, bytes(3200), bytes(3200)]
+        assert client._pending_audio == []
+        assert client.is_connected is False
+
+    def test_finish_sending_flushes_trailing_silence(self, monkeypatch):
+        sent = []
+
+        class FakeWebSocket:
+            async def send(self, data):
+                sent.append(data)
+
+        class FakeLoop:
+            @staticmethod
+            def is_running():
+                return True
+
+        def run_now(coro, loop):
+            asyncio.run(coro)
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_now)
+        client = ASRClient()
+        client._ws = FakeWebSocket()
+        client._loop = FakeLoop()  # type: ignore[assignment]
+        client._connected = True
+
+        client.finish_sending(trailing_silence_ms=200)
+
+        assert client.is_connected is False
+        assert sent == [bytes(3200), bytes(3200)]
+
     def test_connect_releases_event_loop_and_executor(self, monkeypatch):
         async def resolve_once(self, params):
             loop = asyncio.get_running_loop()

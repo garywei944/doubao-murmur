@@ -50,6 +50,7 @@ class ASRClient:
         self._task: asyncio.Task | None = None
         self._lifecycle_lock = threading.Lock()
         self._stop_requested = threading.Event()
+        self._finish_requested = False
 
         # Callbacks (called from asyncio thread - must use GLib.idle_add for GTK)
         self.on_open = None  # () -> None
@@ -128,8 +129,9 @@ class ASRClient:
             except TypeError:
                 ws = await websockets.connect(url, **connect_kwargs)
             try:
-                self._ws = ws
-                self._connected = True
+                with self._lock:
+                    self._ws = ws
+                    self._connected = True
                 logger.info("Connected")
 
                 # Flush buffered audio
@@ -157,8 +159,9 @@ class ASRClient:
                 if self.on_error:
                     self.on_error(e)
         finally:
-            self._connected = False
-            self._ws = None
+            with self._lock:
+                self._connected = False
+                self._ws = None
 
     def _build_url(self, params: ASRParams) -> str:
         """Construct the full WSS URL with query parameters."""
@@ -172,6 +175,8 @@ class ASRClient:
     def send_audio(self, data: bytes) -> None:
         """Send PCM audio data. Thread-safe. Buffers if not connected."""
         with self._lock:
+            if self._finish_requested:
+                return
             if self._connected and self._ws:
                 if self._loop and self._loop.is_running():
                     asyncio.run_coroutine_threadsafe(
@@ -191,18 +196,41 @@ class ASRClient:
         transcribed. The padding is queued at once rather than paced in real time,
         so it costs no extra wall-clock time.
         """
-        with self._lock:
-            self._pending_audio.clear()
-            ws = self._ws
-            was_connected = self._connected
-            self._connected = False
+        chunk_ms = 100
+        silence_chunks = []
+        if trailing_silence_ms > 0:
+            silence = bytes(AUDIO_SAMPLE_RATE * 2 * chunk_ms // 1000)
+            silence_chunks = [
+                silence
+                for _ in range(max(1, trailing_silence_ms // chunk_ms))
+            ]
 
-        if was_connected and ws and trailing_silence_ms > 0:
-            if self._loop and self._loop.is_running():
-                chunk_ms = 100
-                silence = bytes(AUDIO_SAMPLE_RATE * 2 * chunk_ms // 1000)
-                for _ in range(max(1, trailing_silence_ms // chunk_ms)):
-                    asyncio.run_coroutine_threadsafe(ws.send(silence), self._loop)
+        with self._lock:
+            if self._finish_requested:
+                return
+            self._finish_requested = True
+            ws = self._ws
+            loop = self._loop
+            if self._connected and ws and loop and loop.is_running():
+                chunks = list(self._pending_audio) + silence_chunks
+                self._pending_audio.clear()
+                self._connected = False
+                active_ws = ws
+                active_loop = loop
+            else:
+                # A slow handshake must not turn a quick start/stop gesture into
+                # data loss. Keep captured speech and queue the tail padding; the
+                # connection path flushes both in order once the socket opens.
+                self._pending_audio.extend(silence_chunks)
+                chunks = []
+                active_ws = None
+                active_loop = None
+
+        if active_ws is not None and active_loop is not None:
+            for chunk in chunks:
+                asyncio.run_coroutine_threadsafe(
+                    active_ws.send(chunk), active_loop
+                )
 
         logger.info(
             "Finished sending audio (+%dms silence), waiting for final results",
@@ -211,9 +239,9 @@ class ASRClient:
 
     def disconnect(self) -> None:
         """Close the WebSocket."""
-        self._connected = False
         self._stop_requested.set()
         with self._lock:
+            self._connected = False
             self._pending_audio.clear()
         with self._lifecycle_lock:
             loop = self._loop
@@ -229,13 +257,15 @@ class ASRClient:
         with self._lock:
             buffered = list(self._pending_audio)
             self._pending_audio.clear()
+            ws = self._ws
+            loop = self._loop
+            if self._finish_requested:
+                self._connected = False
         if buffered:
             logger.info("Flushing %d buffered audio chunks", len(buffered))
             for chunk in buffered:
-                if self._ws and self._loop and self._loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        self._ws.send(chunk), self._loop
-                    )
+                if ws and loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(ws.send(chunk), loop)
 
     def _handle_message(self, message) -> None:
         """Parse JSON message from server."""
