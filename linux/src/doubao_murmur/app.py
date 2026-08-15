@@ -187,8 +187,10 @@ class DoubaoMurmurApp(Gtk.Application):
         """Extract params, save, destroy WebView."""
 
         def on_params(params):
-            if params:
-                ParamsStore.save(params)
+            if not params or not ParamsStore.save(params):
+                logger.warning("Login completed without usable ASR params")
+                self.app_state.login_status = LoginStatus.NOT_LOGGED_IN
+                return
             if self.login_window:
                 self.login_window.hide()
                 self.login_window.destroy()

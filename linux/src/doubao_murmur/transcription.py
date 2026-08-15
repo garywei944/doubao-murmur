@@ -6,6 +6,7 @@ Key design decisions:
 - GLib.idle_add() marshals callbacks from the asyncio thread to GTK main thread
 - GLib.timeout_add() replaces DispatchQueue.main.asyncAfter for delayed execution
 - State machine exactly mirrors macOS: idle -> starting -> recording -> stopping -> idle
+- Every recording owns a generation-scoped ASR client so stale callbacks are ignored
 """
 
 from __future__ import annotations
@@ -17,7 +18,11 @@ from gi.repository import GLib
 from doubao_murmur.app_state import AppState, LoginStatus, RecordingState
 from doubao_murmur.asr_client import ASRClient
 from doubao_murmur.audio_capture import AudioCapture
-from doubao_murmur.config import AUTH_EXPIRY_DELAY, STOP_SAFETY_TIMEOUT
+from doubao_murmur.config import (
+    AUTH_EXPIRY_DELAY,
+    START_SAFETY_TIMEOUT,
+    STOP_SAFETY_TIMEOUT,
+)
 from doubao_murmur.params_store import ASRParams, ParamsStore
 
 logger = logging.getLogger(__name__)
@@ -35,7 +40,7 @@ def _is_http_auth_rejection(error) -> bool:
     if status is None:
         response = getattr(error, "response", None)
         status = getattr(response, "status_code", None)
-    return status in (401, 403)
+    return status in (200, 401, 403)
 
 
 class TranscriptionManager:
@@ -48,6 +53,9 @@ class TranscriptionManager:
 
         self.using_cached_params = False
         self.awaiting_final_result = False
+        self._session_generation = 0
+        self._active_generation: int | None = None
+        self.start_timer_id: int | None = None
         self.safety_timer_id: int | None = None
 
         # Callbacks set by app.py
@@ -60,20 +68,24 @@ class TranscriptionManager:
         self.on_paste = None  # (text: str) -> None
         self.on_cancel_enabled_changed = None  # (enabled: bool) -> None
 
-        self._wire_asr_callbacks()
-
-    def _wire_asr_callbacks(self) -> None:
-        """Wire ASR client callbacks to marshal from asyncio to GTK thread."""
-        self.asr_client.on_open = lambda: GLib.idle_add(self._on_asr_open)
-        self.asr_client.on_result = lambda text: GLib.idle_add(
-            self._on_asr_result, text
+    def _wire_asr_callbacks(
+        self, client: ASRClient, generation: int
+    ) -> None:
+        """Wire one client's callbacks to its recording generation."""
+        client.on_open = lambda: GLib.idle_add(
+            self._on_asr_open, generation
         )
-        self.asr_client.on_finish = lambda: GLib.idle_add(self._on_asr_finish)
-        self.asr_client.on_error = lambda err: GLib.idle_add(
-            self._on_asr_error, err
+        client.on_result = lambda text: GLib.idle_add(
+            self._on_asr_result, generation, text
         )
-        self.asr_client.on_auth_error = lambda: GLib.idle_add(
-            self._on_auth_error
+        client.on_finish = lambda: GLib.idle_add(
+            self._on_asr_finish, generation
+        )
+        client.on_error = lambda err: GLib.idle_add(
+            self._on_asr_error, generation, err
+        )
+        client.on_auth_error = lambda: GLib.idle_add(
+            self._on_auth_error, generation
         )
 
     # --- Toggle ---
@@ -95,11 +107,27 @@ class TranscriptionManager:
             return
 
         logger.info("Starting recording...")
+        self._session_generation += 1
+        generation = self._session_generation
+        self._active_generation = generation
+
+        # A client belongs to exactly one recording generation. Replacing it
+        # prevents callbacks from an old socket from being rebound to a new run.
+        self.asr_client.disconnect()
+        self.asr_client = ASRClient()
+        self._wire_asr_callbacks(self.asr_client, generation)
+
         self._set_state(RecordingState.STARTING)
         self.app_state.transcription_text = ""
         self.app_state.error_message = None
         if self.on_overlay_show:
             self.on_overlay_show()
+
+        self.start_timer_id = GLib.timeout_add(
+            int(START_SAFETY_TIMEOUT * 1000),
+            self._startup_timeout,
+            generation,
+        )
 
         # Start audio immediately (buffered in ASR client until WS connects)
         try:
@@ -108,7 +136,9 @@ class TranscriptionManager:
             logger.error("Audio capture failed: %s", e)
             self.app_state.error_message = "麦克风启动失败"
             GLib.timeout_add(
-                int(AUTH_EXPIRY_DELAY * 1000), self._reset_to_idle
+                int(AUTH_EXPIRY_DELAY * 1000),
+                self._reset_to_idle,
+                generation,
             )
             return
 
@@ -120,15 +150,20 @@ class TranscriptionManager:
             self.asr_client.connect(cached)
         elif self.on_params_needed:
             self.using_cached_params = False
-            self.on_params_needed(self._on_params_extracted)
+            self.on_params_needed(
+                lambda params: self._on_params_extracted(generation, params)
+            )
         else:
             self.app_state.error_message = "无法获取连接参数，请重新登录"
             GLib.timeout_add(
-                int(AUTH_EXPIRY_DELAY * 1000), self._reset_to_idle
+                int(AUTH_EXPIRY_DELAY * 1000),
+                self._reset_to_idle,
+                generation,
             )
 
     def _stop_recording(self) -> None:
         logger.info("Stopping recording...")
+        self._cancel_start_timer()
         self._set_state(RecordingState.STOPPING)
         self.audio_capture.stop()
         self.asr_client.finish_sending()
@@ -136,25 +171,65 @@ class TranscriptionManager:
 
         # Safety timeout
         self.safety_timer_id = GLib.timeout_add(
-            int(STOP_SAFETY_TIMEOUT * 1000), self._safety_timeout
+            int(STOP_SAFETY_TIMEOUT * 1000),
+            self._safety_timeout,
+            self._active_generation,
         )
 
-    def _safety_timeout(self) -> bool:
-        if self.app_state.recording_state == RecordingState.STOPPING:
+    def _safety_timeout(self, generation: int | None) -> bool:
+        if (
+            generation == self._active_generation
+            and self.app_state.recording_state == RecordingState.STOPPING
+        ):
             logger.info("Safety timeout, completing with current text")
+            self.safety_timer_id = None
             self.awaiting_final_result = False
             self._complete_transcription()
-        self.safety_timer_id = None
         return GLib.SOURCE_REMOVE
+
+    def _startup_timeout(self, generation: int) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
+        self.start_timer_id = None
+        if self.app_state.recording_state == RecordingState.STARTING:
+            logger.warning("ASR startup timed out")
+            self.app_state.error_message = "连接豆包超时"
+            self.audio_capture.stop()
+            self.asr_client.disconnect()
+            GLib.timeout_add(
+                int(AUTH_EXPIRY_DELAY * 1000),
+                self._reset_to_idle,
+                generation,
+            )
+        return GLib.SOURCE_REMOVE
+
+    def _cancel_start_timer(self) -> None:
+        if self.start_timer_id is not None:
+            GLib.source_remove(self.start_timer_id)
+            self.start_timer_id = None
+
+    def _cancel_safety_timer(self) -> None:
+        if self.safety_timer_id is not None:
+            GLib.source_remove(self.safety_timer_id)
+            self.safety_timer_id = None
+
+    def _is_active_generation(self, generation: int) -> bool:
+        return generation == self._active_generation
 
     # --- ASR callbacks (on GTK main thread via GLib.idle_add) ---
 
-    def _on_asr_open(self) -> bool:
+    def _on_asr_open(self, generation: int) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
+        self._cancel_start_timer()
         if self.app_state.recording_state == RecordingState.STARTING:
             self._set_state(RecordingState.RECORDING)
         return GLib.SOURCE_REMOVE
 
-    def _on_asr_result(self, text: str) -> bool:
+    def _on_asr_result(self, generation: int, text: str) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
+        self._cancel_start_timer()
         self.app_state.transcription_text = text
         if self.on_overlay_update:
             self.on_overlay_update(text)
@@ -165,7 +240,9 @@ class TranscriptionManager:
             self._complete_transcription()
         return GLib.SOURCE_REMOVE
 
-    def _on_asr_finish(self) -> bool:
+    def _on_asr_finish(self, generation: int) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
         self.awaiting_final_result = False
         if self.app_state.recording_state in (
             RecordingState.STOPPING,
@@ -174,7 +251,10 @@ class TranscriptionManager:
             self._complete_transcription()
         return GLib.SOURCE_REMOVE
 
-    def _on_asr_error(self, error) -> bool:
+    def _on_asr_error(self, generation: int, error) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
+        self._cancel_start_timer()
         if self.app_state.recording_state == RecordingState.IDLE:
             return GLib.SOURCE_REMOVE
         logger.error("ASR error: %s", error)
@@ -188,10 +268,16 @@ class TranscriptionManager:
             self._handle_auth_failure()
             return GLib.SOURCE_REMOVE
         self.app_state.error_message = "连接出错"
-        GLib.timeout_add(int(AUTH_EXPIRY_DELAY * 1000), self._reset_to_idle)
+        GLib.timeout_add(
+            int(AUTH_EXPIRY_DELAY * 1000),
+            self._reset_to_idle,
+            generation,
+        )
         return GLib.SOURCE_REMOVE
 
-    def _on_auth_error(self) -> bool:
+    def _on_auth_error(self, generation: int) -> bool:
+        if not self._is_active_generation(generation):
+            return GLib.SOURCE_REMOVE
         self._handle_auth_failure()
         return GLib.SOURCE_REMOVE
 
@@ -204,7 +290,11 @@ class TranscriptionManager:
             self.on_paste(text)
         self._reset_to_idle()
 
-    def _reset_to_idle(self) -> bool:
+    def _reset_to_idle(self, generation: int | None = None) -> bool:
+        if generation is not None and generation != self._active_generation:
+            return GLib.SOURCE_REMOVE
+        self._cancel_start_timer()
+        self._cancel_safety_timer()
         self.awaiting_final_result = False
         self.audio_capture.stop()
         self.asr_client.disconnect()
@@ -213,11 +303,20 @@ class TranscriptionManager:
         if self.on_overlay_hide:
             self.on_overlay_hide()
         self.using_cached_params = False
+        finished_generation = self._active_generation
+        self._active_generation = None
         # Clear text after short delay
         GLib.timeout_add(
-            200, lambda: setattr(self.app_state, "transcription_text", "")
-            or GLib.SOURCE_REMOVE
+            200, self._clear_text_after_reset, finished_generation
         )
+        return GLib.SOURCE_REMOVE
+
+    def _clear_text_after_reset(self, generation: int | None) -> bool:
+        if (
+            self._active_generation is None
+            and generation == self._session_generation
+        ):
+            self.app_state.transcription_text = ""
         return GLib.SOURCE_REMOVE
 
     def handle_cancel(self) -> None:
@@ -245,13 +344,22 @@ class TranscriptionManager:
         if self.on_cancel_enabled_changed:
             self.on_cancel_enabled_changed(new_state != RecordingState.IDLE)
 
-    def _on_params_extracted(self, params: ASRParams | None) -> None:
+    def _on_params_extracted(
+        self, generation: int, params: ASRParams | None
+    ) -> None:
         """Called when WebView param extraction completes."""
+        if (
+            not self._is_active_generation(generation)
+            or self.app_state.recording_state != RecordingState.STARTING
+        ):
+            return
         if params:
-            ParamsStore.save(params)
-            self.asr_client.connect(params)
-        else:
-            self.app_state.error_message = "无法获取连接参数，请重新登录"
-            GLib.timeout_add(
-                int(AUTH_EXPIRY_DELAY * 1000), self._reset_to_idle
-            )
+            if ParamsStore.save(params):
+                self.asr_client.connect(params)
+                return
+        self.app_state.error_message = "无法获取连接参数，请重新登录"
+        GLib.timeout_add(
+            int(AUTH_EXPIRY_DELAY * 1000),
+            self._reset_to_idle,
+            generation,
+        )

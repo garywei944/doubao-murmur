@@ -2,6 +2,8 @@
 
 import json
 import builtins
+import asyncio
+import threading
 
 import pytest
 
@@ -209,3 +211,49 @@ class TestDependencyHandling:
 
         assert _is_connection_closed_error(ConnectionClosedOK())
         assert not _is_connection_closed_error(RuntimeError())
+
+
+class TestConnectionLifecycle:
+    def test_connect_releases_event_loop_and_executor(self, monkeypatch):
+        async def resolve_once(self, params):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: None)
+
+        monkeypatch.setattr(ASRClient, "_connect_and_listen", resolve_once)
+        client = ASRClient()
+
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+        assert client._thread is not None
+        assert client._loop is not None
+        client._thread.join(timeout=2)
+
+        assert not client._thread.is_alive()
+        assert client._loop.is_closed()
+
+    def test_disconnect_cancels_connection_before_websocket_opens(
+        self, monkeypatch
+    ):
+        started = threading.Event()
+
+        async def blocked_connect(self, params):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(ASRClient, "_connect_and_listen", blocked_connect)
+        client = ASRClient()
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+        assert started.wait(timeout=1)
+        assert client._thread is not None
+        assert client._loop is not None
+
+        try:
+            client.disconnect()
+            client._thread.join(timeout=1)
+            assert not client._thread.is_alive()
+            assert client._loop.is_closed()
+        finally:
+            if client._thread.is_alive():
+                client._loop.call_soon_threadsafe(
+                    lambda: [task.cancel() for task in asyncio.all_tasks()]
+                )
+                client._thread.join(timeout=1)
