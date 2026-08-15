@@ -134,6 +134,11 @@ class ASRClient:
                 open_timeout=5,
                 close_timeout=3,
                 max_size=2**20,
+                # Doubao's streaming endpoint doesn't reliably answer the
+                # periodic protocol pings enabled by websockets by default.
+                # Continuous audio already supplies application traffic; leaving
+                # the default on closes healthy long recordings after about 40s.
+                ping_interval=None,
                 **header_kwargs,
             )
             # Race IPv4/IPv6 (happy eyeballs). Without this, a blackholed

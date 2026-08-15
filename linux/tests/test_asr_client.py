@@ -215,6 +215,38 @@ class TestDependencyHandling:
 
 
 class TestConnectionLifecycle:
+    def test_connect_disables_periodic_protocol_keepalive(self, monkeypatch):
+        connect_kwargs = {}
+
+        class FakeWebSocket:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                connect_kwargs.update(kwargs)
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+
+        assert client._thread is not None
+        client._thread.join(timeout=2)
+
+        assert not client._thread.is_alive()
+        assert connect_kwargs["ping_interval"] is None
+
     def test_connection_closed_while_flushing_buffer_reports_error(
         self, monkeypatch
     ):
