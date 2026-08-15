@@ -3,6 +3,7 @@
 import json
 import builtins
 import asyncio
+import gc
 import threading
 
 import pytest
@@ -214,6 +215,172 @@ class TestDependencyHandling:
 
 
 class TestConnectionLifecycle:
+    def test_connection_closed_while_flushing_buffer_reports_error(
+        self, monkeypatch
+    ):
+        errors = []
+
+        class ConnectionClosedDuringFlush(Exception):
+            pass
+
+        class FakeWebSocket:
+            async def send(self, data):
+                raise ConnectionClosedDuringFlush("closed while flushing")
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.on_error = errors.append
+        client.send_audio(b"buffered-before-open")
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+
+        assert client._thread is not None
+        client._thread.join(timeout=2)
+
+        assert not client._thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ConnectionClosedDuringFlush)
+
+    def test_live_audio_cannot_overtake_buffered_audio_during_open(
+        self, monkeypatch
+    ):
+        buffered_send_started = threading.Event()
+        allow_buffered_send = threading.Event()
+        all_audio_sent = threading.Event()
+        sent = []
+        buffered = b"buffered-before-open"
+        live = b"live-during-open"
+
+        class FakeWebSocket:
+            async def send(self, data):
+                if data == buffered:
+                    buffered_send_started.set()
+                    while not allow_buffered_send.is_set():
+                        await asyncio.sleep(0.001)
+                sent.append(data)
+                if len(sent) == 2:
+                    all_audio_sent.set()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                while not all_audio_sent.is_set():
+                    await asyncio.sleep(0.001)
+                raise StopAsyncIteration
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.send_audio(buffered)
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+
+        try:
+            assert buffered_send_started.wait(timeout=1)
+            client.send_audio(live)
+            assert client._loop is not None
+
+            async def event_loop_barrier():
+                await asyncio.sleep(0)
+
+            asyncio.run_coroutine_threadsafe(
+                event_loop_barrier(), client._loop
+            ).result(timeout=1)
+            allow_buffered_send.set()
+
+            assert client._thread is not None
+            client._thread.join(timeout=2)
+            assert not client._thread.is_alive()
+            assert sent == [buffered, live]
+        finally:
+            allow_buffered_send.set()
+            if client._thread is not None and client._thread.is_alive():
+                client.disconnect()
+                client._thread.join(timeout=1)
+
+    def test_early_stop_open_waits_until_buffered_audio_is_sent(
+        self, monkeypatch
+    ):
+        send_started = threading.Event()
+        allow_send = threading.Event()
+        send_finished = threading.Event()
+        events = []
+        speech = b"speech-buffered-before-early-stop"
+
+        class FakeWebSocket:
+            async def send(self, data):
+                send_started.set()
+                while not allow_send.is_set():
+                    await asyncio.sleep(0.001)
+                events.append(("sent", data))
+                send_finished.set()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                while not send_finished.is_set():
+                    await asyncio.sleep(0.001)
+                raise StopAsyncIteration
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.on_open = lambda: events.append(("open", None))
+        client.send_audio(speech)
+        client.finish_sending(trailing_silence_ms=0)
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+
+        try:
+            assert send_started.wait(timeout=1)
+            allow_send.set()
+            assert client._thread is not None
+            client._thread.join(timeout=2)
+
+            assert not client._thread.is_alive()
+            assert events == [("sent", speech), ("open", None)]
+        finally:
+            allow_send.set()
+            if client._thread is not None and client._thread.is_alive():
+                client.disconnect()
+                client._thread.join(timeout=1)
+
     def test_slow_connect_flushes_early_stop_audio_in_order(self, monkeypatch):
         connect_started = threading.Event()
         allow_connect = threading.Event()
@@ -288,16 +455,6 @@ class TestConnectionLifecycle:
         class FakeWebSocket:
             async def send(self, data):
                 sent.append(data)
-
-        class FakeLoop:
-            @staticmethod
-            def is_running():
-                return True
-
-        def run_now(coro, loop):
-            asyncio.run(coro)
-
-        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_now)
         client = ASRClient()
         speech = b"captured-before-websocket-opened"
         client.send_audio(speech)
@@ -307,9 +464,8 @@ class TestConnectionLifecycle:
         assert client._pending_audio == [speech, bytes(3200), bytes(3200)]
 
         client._ws = FakeWebSocket()
-        client._loop = FakeLoop()  # type: ignore[assignment]
         client._connected = True
-        client._flush_audio_buffer()
+        asyncio.run(client._flush_audio_buffer(client._ws))
 
         assert sent == [speech, bytes(3200), bytes(3200)]
         assert client._pending_audio == []
@@ -384,3 +540,59 @@ class TestConnectionLifecycle:
                     lambda: [task.cancel() for task in asyncio.all_tasks()]
                 )
                 client._thread.join(timeout=1)
+
+    def test_disconnect_drains_pending_send_tasks_before_loop_close(
+        self, monkeypatch
+    ):
+        opened = threading.Event()
+        send_started = threading.Event()
+        loop_errors = []
+
+        class FakeWebSocket:
+            async def send(self, data):
+                send_started.set()
+                await asyncio.Event().wait()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                loop = asyncio.get_running_loop()
+                loop.set_exception_handler(
+                    lambda _loop, context: loop_errors.append(context)
+                )
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.on_open = lambda: opened.set()  # type: ignore[assignment]
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+
+        assert opened.wait(timeout=1)
+        client.send_audio(b"in-flight-live-audio")
+        assert send_started.wait(timeout=1)
+        assert client._thread is not None
+
+        client.disconnect()
+        client._thread.join(timeout=2)
+        gc.collect()
+
+        assert not client._thread.is_alive()
+        assert client._loop is not None
+        assert client._loop.is_closed()
+        assert [
+            context
+            for context in loop_errors
+            if context.get("message") == "Task was destroyed but it is pending!"
+        ] == []

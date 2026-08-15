@@ -175,11 +175,64 @@ def test_late_parameter_extraction_does_not_connect_after_timeout(monkeypatch):
     assert len(callbacks) == 1
 
     fire_timer(timers, 0)
+    callbacks[0](ASRParams(cookies={}, device_id="d", web_id="w"))
+
+    assert state.recording_state == RecordingState.STARTING
+    assert client.connected == 0
+
     fire_timer(timers, 1)
     callbacks[0](ASRParams(cookies={}, device_id="d", web_id="w"))
 
     assert state.recording_state == RecordingState.IDLE
     assert client.connected == 0
+
+
+def test_stop_before_parameter_extraction_connects_when_params_arrive(monkeypatch):
+    manager, state, _, timers, _ = make_manager(monkeypatch, None)
+    callbacks = []
+    manager.on_params_needed = callbacks.append
+
+    manager.handle_toggle()
+    client = manager.asr_client
+    manager.handle_toggle()
+
+    assert state.recording_state == RecordingState.STOPPING
+    assert timers[1][0] == 7000
+    assert client.connected == 0
+
+    callbacks[0](ASRParams(cookies={}, device_id="d", web_id="w"))
+
+    assert state.recording_state == RecordingState.STOPPING
+    assert client.connected == 1
+
+
+def test_stale_parameter_callback_cannot_connect_new_stopping_generation(
+    monkeypatch,
+):
+    manager, state, _, _, _ = make_manager(monkeypatch, None)
+    callbacks = []
+    manager.on_params_needed = callbacks.append
+    params = ASRParams(cookies={}, device_id="d", web_id="w")
+
+    manager.handle_toggle()
+    old_client = manager.asr_client
+    manager.handle_cancel()
+
+    manager.handle_toggle()
+    new_client = manager.asr_client
+    manager.handle_toggle()
+
+    assert state.recording_state == RecordingState.STOPPING
+    assert len(callbacks) == 2
+
+    callbacks[0](params)
+
+    assert old_client.connected == 0
+    assert new_client.connected == 0
+
+    callbacks[1](params)
+
+    assert new_client.connected == 1
 
 
 def test_stop_waits_for_result_stream_to_go_quiet(monkeypatch):
@@ -196,6 +249,7 @@ def test_stop_waits_for_result_stream_to_go_quiet(monkeypatch):
 
     manager.handle_toggle()
     assert state.recording_state == RecordingState.STOPPING
+    assert timers[1][0] == 1500
 
     client.on_result("一二三四五六七八九十")
     assert pasted == []
@@ -207,7 +261,7 @@ def test_stop_waits_for_result_stream_to_go_quiet(monkeypatch):
     assert state.recording_state == RecordingState.IDLE
 
 
-def test_stop_while_connecting_preserves_start_deadline_then_rearms(monkeypatch):
+def test_stop_while_connecting_keeps_start_deadline_after_open(monkeypatch):
     params = ASRParams(cookies={}, device_id="d", web_id="w")
     manager, state, _, timers, removed = make_manager(monkeypatch, params)
 
@@ -221,8 +275,9 @@ def test_stop_while_connecting_preserves_start_deadline_then_rearms(monkeypatch)
     assert client.on_open is not None
     client.on_open()
 
-    assert timers[2][0] == 1500
-    assert 2 in removed
+    assert len(timers) == 2
+    assert manager.safety_timer_id == 2
+    assert 2 not in removed
 
 
 def test_stale_quiet_timer_cannot_complete_new_recording(monkeypatch):

@@ -175,8 +175,10 @@ class TranscriptionManager:
         self.awaiting_final_result = True
 
         # A stop pressed during a slow handshake must leave enough time for the
-        # queued speech to connect and flush. Once the socket opens, _on_asr_open
-        # replaces this with the normal short final-result deadline.
+        # queued speech and trailing silence to connect and flush. Normal
+        # recordings retain the short final-result deadline; early stops keep
+        # the startup allowance as a fallback until a result/finish callback
+        # completes them.
         self._arm_safety_timeout(
             START_SAFETY_TIMEOUT if was_starting else STOP_SAFETY_TIMEOUT,
             self._active_generation,
@@ -273,13 +275,11 @@ class TranscriptionManager:
         self._cancel_start_timer()
         if self.app_state.recording_state == RecordingState.STARTING:
             self._set_state(RecordingState.RECORDING)
-        elif (
-            self.app_state.recording_state == RecordingState.STOPPING
-            and self.awaiting_final_result
-        ):
-            self._arm_safety_timeout(
-                STOP_SAFETY_TIMEOUT, generation
-            )
+        # If the user stopped during startup, keep the original 7-second
+        # allowance. The socket can become publishable just before
+        # finish_sending() schedules trailing silence, so on_open alone does not
+        # prove that the final audio writes have completed. Results still finish
+        # promptly via the quiet-period/finish callbacks; this timer is fallback.
         return GLib.SOURCE_REMOVE
 
     def _on_asr_result(self, generation: int, text: str) -> bool:
@@ -411,10 +411,14 @@ class TranscriptionManager:
         self, generation: int, params: ASRParams | None
     ) -> None:
         """Called when WebView param extraction completes."""
-        if (
-            not self._is_active_generation(generation)
-            or self.app_state.recording_state != RecordingState.STARTING
-        ):
+        state = self.app_state.recording_state
+        can_connect = (
+            state == RecordingState.STARTING
+            and self.start_timer_id is not None
+        ) or (
+            state == RecordingState.STOPPING and self.awaiting_final_result
+        )
+        if not self._is_active_generation(generation) or not can_connect:
             return
         if params:
             if ParamsStore.save(params):

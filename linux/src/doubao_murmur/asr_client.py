@@ -43,6 +43,7 @@ class ASRClient:
     def __init__(self) -> None:
         self._ws: Any | None = None
         self._connected = False
+        self._flushing_audio = False
         self._pending_audio: list[bytes] = []
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -91,6 +92,23 @@ class ASRClient:
         except asyncio.CancelledError:
             pass
         finally:
+            # Audio sends and websockets keepalive tasks share this per-session
+            # loop but aren't children of the main receive task. Letting the loop
+            # close while any of them are still running leaves send_context async
+            # generators half-open and produces "Task was destroyed" warnings on
+            # a rapid next recording. Cancel and drain every remaining task before
+            # shutting down loop-owned resources.
+            pending = [
+                pending_task
+                for pending_task in asyncio.all_tasks(loop)
+                if not pending_task.done()
+            ]
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.run_until_complete(loop.shutdown_default_executor())
             loop.close()
@@ -131,11 +149,17 @@ class ASRClient:
             try:
                 with self._lock:
                     self._ws = ws
-                    self._connected = True
+                    self._flushing_audio = True
                 logger.info("Connected")
 
-                # Flush buffered audio
-                self._flush_audio_buffer()
+                # Keep the connection unpublished while draining buffered audio.
+                # Live mic callbacks continue buffering behind the older chunks,
+                # and an early stop can append its trailing silence to the same
+                # ordered drain before the normal final-result deadline begins.
+                await self._flush_audio_buffer(ws)
+
+                if self._stop_requested.is_set():
+                    return
 
                 if self.on_open:
                     self.on_open()
@@ -149,10 +173,13 @@ class ASRClient:
         except Exception as e:
             if _is_connection_closed_error(e):
                 logger.warning("WebSocket closed: %s", e)
-                if self._connected:
+                with self._lock:
+                    should_report = (
+                        self._connected or self._flushing_audio
+                    ) and not self._stop_requested.is_set()
                     self._connected = False
-                    if self.on_error:
-                        self.on_error(e)
+                if should_report and self.on_error:
+                    self.on_error(e)
             else:
                 logger.error("WebSocket error: %s", e)
                 self._connected = False
@@ -161,6 +188,7 @@ class ASRClient:
         finally:
             with self._lock:
                 self._connected = False
+                self._flushing_audio = False
                 self._ws = None
 
     def _build_url(self, params: ASRParams) -> str:
@@ -253,19 +281,30 @@ class ASRClient:
                     task.cancel()
         logger.info("Disconnected")
 
-    def _flush_audio_buffer(self) -> None:
-        with self._lock:
-            buffered = list(self._pending_audio)
-            self._pending_audio.clear()
-            ws = self._ws
-            loop = self._loop
-            if self._finish_requested:
-                self._connected = False
-        if buffered:
+    async def _flush_audio_buffer(self, ws: Any) -> None:
+        """Drain pre-open audio before publishing the live connection.
+
+        Audio callbacks can run concurrently with the asyncio connection thread.
+        Keeping ``_connected`` false until an atomic empty-buffer check makes
+        those callbacks append behind the batch currently being sent instead of
+        scheduling newer chunks ahead of it.
+        """
+        while True:
+            with self._lock:
+                buffered = list(self._pending_audio)
+                self._pending_audio.clear()
+                if not buffered:
+                    if self._ws is ws:
+                        self._connected = (
+                            not self._finish_requested
+                            and not self._stop_requested.is_set()
+                        )
+                        self._flushing_audio = False
+                    return
+
             logger.info("Flushing %d buffered audio chunks", len(buffered))
             for chunk in buffered:
-                if ws and loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(ws.send(chunk), loop)
+                await ws.send(chunk)
 
     def _handle_message(self, message) -> None:
         """Parse JSON message from server."""
