@@ -180,3 +180,56 @@ def test_late_parameter_extraction_does_not_connect_after_timeout(monkeypatch):
 
     assert state.recording_state == RecordingState.IDLE
     assert client.connected == 0
+
+
+def test_stop_waits_for_result_stream_to_go_quiet(monkeypatch):
+    params = ASRParams(cookies={}, device_id="d", web_id="w")
+    manager, state, _, timers, _ = make_manager(monkeypatch, params)
+    pasted = []
+    manager.on_paste = pasted.append
+
+    manager.handle_toggle()
+    client = manager.asr_client
+    assert client.on_open is not None
+    assert client.on_result is not None
+    client.on_open()
+
+    manager.handle_toggle()
+    assert state.recording_state == RecordingState.STOPPING
+
+    client.on_result("一二三四五六七八九十")
+    assert pasted == []
+    assert state.recording_state == RecordingState.STOPPING
+
+    fire_timer(timers, 2)
+
+    assert pasted == ["一二三四五六七八九十"]
+    assert state.recording_state == RecordingState.IDLE
+
+
+def test_stale_quiet_timer_cannot_complete_new_recording(monkeypatch):
+    params = ASRParams(cookies={}, device_id="d", web_id="w")
+    manager, state, _, timers, _ = make_manager(monkeypatch, params)
+    pasted = []
+    manager.on_paste = pasted.append
+
+    manager.handle_toggle()
+    old_client = manager.asr_client
+    assert old_client.on_open is not None
+    assert old_client.on_result is not None
+    old_client.on_open()
+    manager.handle_toggle()
+    old_client.on_result("旧结果")
+    old_quiet_timer = timers[2]
+
+    manager.handle_cancel()
+    manager.handle_toggle()
+    new_client = manager.asr_client
+    assert new_client.on_open is not None
+    new_client.on_open()
+
+    _, callback, args = old_quiet_timer
+    callback(*args)
+
+    assert pasted == []
+    assert state.recording_state == RecordingState.RECORDING

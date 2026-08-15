@@ -214,6 +214,32 @@ class TestDependencyHandling:
 
 
 class TestConnectionLifecycle:
+    def test_finish_sending_flushes_trailing_silence(self, monkeypatch):
+        sent = []
+
+        class FakeWebSocket:
+            async def send(self, data):
+                sent.append(data)
+
+        class FakeLoop:
+            @staticmethod
+            def is_running():
+                return True
+
+        def run_now(coro, loop):
+            asyncio.run(coro)
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_now)
+        client = ASRClient()
+        client._ws = FakeWebSocket()
+        client._loop = FakeLoop()
+        client._connected = True
+
+        client.finish_sending(trailing_silence_ms=200)
+
+        assert client.is_connected is False
+        assert sent == [bytes(3200), bytes(3200)]
+
     def test_connect_releases_event_loop_and_executor(self, monkeypatch):
         async def resolve_once(self, params):
             loop = asyncio.get_running_loop()
