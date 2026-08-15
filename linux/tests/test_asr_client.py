@@ -214,6 +214,72 @@ class TestDependencyHandling:
 
 
 class TestConnectionLifecycle:
+    def test_slow_connect_flushes_early_stop_audio_in_order(self, monkeypatch):
+        connect_started = threading.Event()
+        allow_connect = threading.Event()
+        sent = []
+        results = []
+        finishes = []
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.message_index = 0
+
+            async def send(self, data):
+                sent.append(data)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                for _ in range(100):
+                    if len(sent) >= 3:
+                        break
+                    await asyncio.sleep(0.001)
+                if self.message_index == 0:
+                    self.message_index += 1
+                    return json.dumps(
+                        {"code": 0, "event": "result", "result": {"Text": "完整"}}
+                    )
+                if self.message_index == 1:
+                    self.message_index += 1
+                    return json.dumps({"code": 0, "event": "finish"})
+                raise StopAsyncIteration
+
+            async def close(self):
+                return None
+
+        class FakeWebsockets:
+            @staticmethod
+            async def connect(url, **kwargs):
+                connect_started.set()
+                while not allow_connect.is_set():
+                    await asyncio.sleep(0.001)
+                return FakeWebSocket()
+
+        monkeypatch.setattr(
+            "doubao_murmur.asr_client._load_websockets",
+            lambda: FakeWebsockets,
+        )
+        client = ASRClient()
+        client.on_result = results.append
+        client.on_finish = lambda: finishes.append(True)
+        speech = b"speech-buffered-during-handshake"
+
+        client.connect(ASRParams(cookies={}, device_id="d", web_id="w"))
+        assert connect_started.wait(timeout=1)
+        client.send_audio(speech)
+        client.finish_sending(trailing_silence_ms=200)
+        allow_connect.set()
+
+        assert client._thread is not None
+        client._thread.join(timeout=2)
+
+        assert not client._thread.is_alive()
+        assert sent == [speech, bytes(3200), bytes(3200)]
+        assert results == ["完整"]
+        assert finishes == [True]
+
     def test_finish_before_connect_preserves_audio_and_queues_silence(
         self, monkeypatch
     ):
