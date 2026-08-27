@@ -628,3 +628,24 @@ class TestConnectionLifecycle:
             for context in loop_errors
             if context.get("message") == "Task was destroyed but it is pending!"
         ] == []
+
+
+class TestServerErrorLogging:
+    def test_non_auth_error_is_logged(self, client, caplog):
+        import json
+        import logging
+
+        msg = json.dumps({"code": 12345, "message": "rate limited"})
+        with caplog.at_level(logging.WARNING):
+            client._handle_message(msg)
+        assert "ASR server error" in caplog.text
+        assert "12345" in caplog.text
+
+    def test_unknown_event_is_logged(self, client, caplog):
+        import json
+        import logging
+
+        msg = json.dumps({"code": 0, "event": "session_expired"})
+        with caplog.at_level(logging.WARNING):
+            client._handle_message(msg)
+        assert "session_expired" in caplog.text

@@ -246,6 +246,7 @@ def test_stop_waits_for_result_stream_to_go_quiet(monkeypatch):
     assert client.on_open is not None
     assert client.on_result is not None
     client.on_open()
+    client.on_result("一二三")
 
     manager.handle_toggle()
     assert state.recording_state == RecordingState.STOPPING
@@ -306,3 +307,26 @@ def test_stale_quiet_timer_cannot_complete_new_recording(monkeypatch):
 
     assert pasted == []
     assert state.recording_state == RecordingState.RECORDING
+
+
+def test_stop_without_any_result_uses_longer_safety_timeout(monkeypatch):
+    """A slow connect + backlog flush may leave zero results at stop time."""
+    params = ASRParams(cookies={}, device_id="d", web_id="w")
+    manager, state, _, timers, _ = make_manager(monkeypatch, params)
+    pasted = []
+    manager.on_paste = pasted.append
+
+    manager.handle_toggle()
+    client = manager.asr_client
+    client.on_open()
+    assert state.recording_state == RecordingState.RECORDING
+
+    manager.handle_toggle()
+    assert state.recording_state == RecordingState.STOPPING
+    assert timers[1][0] == 5000
+
+    # A late result still finishes via the quiet period, not the deadline.
+    client.on_result("迟到的结果")
+    fire_timer(timers, 2)
+    assert pasted == ["迟到的结果"]
+    assert state.recording_state == RecordingState.IDLE

@@ -22,6 +22,7 @@ from doubao_murmur.config import (
     AUTH_EXPIRY_DELAY,
     FINAL_RESULT_QUIET_PERIOD,
     START_SAFETY_TIMEOUT,
+    STOP_NO_RESULT_TIMEOUT,
     STOP_SAFETY_TIMEOUT,
 )
 from doubao_murmur.params_store import ASRParams, ParamsStore
@@ -178,11 +179,17 @@ class TranscriptionManager:
         # queued speech and trailing silence to connect and flush. Normal
         # recordings retain the short final-result deadline; early stops keep
         # the startup allowance as a fallback until a result/finish callback
-        # completes them.
-        self._arm_safety_timeout(
-            START_SAFETY_TIMEOUT if was_starting else STOP_SAFETY_TIMEOUT,
-            self._active_generation,
-        )
+        # completes them. A recording that never produced a result (slow
+        # connect, large backlog still being transcribed) gets a longer
+        # allowance: the quiet-period timer still finishes it promptly once
+        # results arrive, so this only extends the empty-transcript case.
+        if was_starting:
+            timeout = START_SAFETY_TIMEOUT
+        elif not self.app_state.transcription_text:
+            timeout = STOP_NO_RESULT_TIMEOUT
+        else:
+            timeout = STOP_SAFETY_TIMEOUT
+        self._arm_safety_timeout(timeout, self._active_generation)
 
     def _arm_safety_timeout(
         self, timeout: float, generation: int | None

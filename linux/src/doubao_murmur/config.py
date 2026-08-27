@@ -79,6 +79,11 @@ def get_overlay_config_path() -> Path:
 
 START_SAFETY_TIMEOUT = 7.0  # seconds
 STOP_SAFETY_TIMEOUT = 1.5  # seconds; upper bound on waiting for final results
+# Used instead when the server has not returned a single result by the time
+# recording stops (slow handshake followed by a large backlog flush). Giving up
+# after 1.5s in that state discards the whole utterance; observed backlog
+# catch-up needs several seconds.
+STOP_NO_RESULT_TIMEOUT = 5.0  # seconds
 # Trailing digital silence flushed when recording stops. The service emits one
 # result per audio message and withholds the last word until more audio arrives,
 # so without this padding the tail of the utterance is never transcribed.

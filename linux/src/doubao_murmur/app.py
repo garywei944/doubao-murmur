@@ -6,6 +6,7 @@ Orchestrates all components and manages the application lifecycle.
 from __future__ import annotations
 
 import logging
+import threading
 
 import gi
 
@@ -215,8 +216,18 @@ class DoubaoMurmurApp(Gtk.Application):
             callback(None)
 
     def _do_paste(self, text: str) -> None:
-        """Copy and paste transcription."""
-        PasteHelper.copy_and_paste(text)
+        """Copy and paste transcription.
+
+        Runs off the GTK main thread: wl-copy + window probing + key
+        injection take ~0.5s and would stall the overlay hide otherwise.
+        PasteHelper only uses subprocesses and uinput, no GTK.
+        """
+        threading.Thread(
+            target=PasteHelper.copy_and_paste,
+            args=(text,),
+            name="doubao-paste",
+            daemon=True,
+        ).start()
 
     def _show_overlay(self) -> None:
         if self.overlay:

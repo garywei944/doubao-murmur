@@ -212,9 +212,7 @@ class ASRClient:
                 return
             if self._connected and self._ws:
                 if self._loop and self._loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        self._ws.send(data), self._loop
-                    )
+                    _submit_send(self._ws, data, self._loop)
             else:
                 self._pending_audio.append(data)
 
@@ -261,9 +259,7 @@ class ASRClient:
 
         if active_ws is not None and active_loop is not None:
             for chunk in chunks:
-                asyncio.run_coroutine_threadsafe(
-                    active_ws.send(chunk), active_loop
-                )
+                _submit_send(active_ws, chunk, active_loop)
 
         logger.info(
             "Finished sending audio (+%dms silence), waiting for final results",
@@ -334,10 +330,17 @@ class ASRClient:
                 logger.warning(
                     "Auth error detected: code=%d, message=%s", code, msg
                 )
-                self._connected = False
+                with self._lock:
+                    self._connected = False
                 if self.on_auth_error:
                     self.on_auth_error()
                 return
+            # Non-auth server errors used to vanish here, so an empty
+            # transcript after a slow start had no explanation in the log.
+            logger.warning(
+                "ASR server error: code=%s, event=%s, message=%s",
+                code, event or "-", msg or "-",
+            )
 
         if event == "result":
             result = data.get("result") or {}
@@ -348,6 +351,23 @@ class ASRClient:
             logger.info("Received finish event")
             if self.on_finish:
                 self.on_finish()
+        elif event:
+            logger.warning("Unhandled ASR event %r: %s", event, message[:200])
+
+
+def _submit_send(ws: Any, data: bytes, loop: asyncio.AbstractEventLoop) -> None:
+    """Schedule ws.send on the client loop; log failures instead of dropping them."""
+    future = asyncio.run_coroutine_threadsafe(ws.send(data), loop)
+    if future is not None:  # tests stub the scheduler with a plain call
+        future.add_done_callback(_log_send_failure)
+
+
+def _log_send_failure(future) -> None:
+    if future.cancelled():
+        return
+    error = future.exception()
+    if error is not None and not _is_connection_closed_error(error):
+        logger.warning("Audio send failed: %s", error)
 
 
 def _load_websockets():
